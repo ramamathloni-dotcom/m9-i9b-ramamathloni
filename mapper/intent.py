@@ -13,6 +13,7 @@ off-template question is the silent-failure mode the Reading warns
 against. Prefer None over a false positive.
 """
 
+import re
 from .shapes import ShapeId
 
 
@@ -43,12 +44,46 @@ def detect_shape(question: str) -> ShapeId | None:
     UnsupportedQueryError in that case, which is the correct behaviour
     for an out-of-scope question.
     """
-    # TODO (intent classifier):
-    # 1. Lowercase the question for pattern matching.
-    # 2. Apply rules in priority order — more-specific shapes (q14
-    #    "but not", q8 "by ... that use") before less-specific (q1, q3).
-    # 3. Return the matching ShapeId, or None if nothing matches.
-    raise NotImplementedError(
-        "detect_shape is not yet implemented — see the Integration Guide "
-        "Intent Classification section and the docstring above."
-    )
+    question_lower = question.lower()
+
+    if "but not" in question_lower or "without" in question_lower:
+        return ShapeId.Q14
+    if "or any subtype" in question_lower or "or any kind" in question_lower:
+        return ShapeId.Q13
+    if "optionally tagged" in question_lower:
+        return ShapeId.Q15
+    if "ingredients used in" in question_lower:
+        return ShapeId.Q11
+    if "authors of" in question_lower:
+        return ShapeId.Q12
+    if "ranked by popularity" in question_lower or "most popular" in question_lower:
+        return ShapeId.Q9
+    if re.search(r"under \d+\s*minutes", question_lower):
+        return ShapeId.Q10
+    if "require" in question_lower:
+        return ShapeId.Q7
+
+    has_author = "by author" in question_lower or re.search(r"\bby\b", question_lower)
+    has_ingredient = "use " in question_lower or "with " in question_lower
+
+    if has_author and has_ingredient:
+        return ShapeId.Q8
+
+    cuisine_match = re.search(r"find (\w+) recipes", question_lower)
+    if cuisine_match:
+        cuisine = cuisine_match.group(1)
+        hierarchical_cuisines = {"asian", "chinese", "world"}
+        is_hierarchical = cuisine in hierarchical_cuisines
+
+        if has_ingredient:
+            return ShapeId.Q6 if is_hierarchical else ShapeId.Q5
+        else:
+            return ShapeId.Q4 if is_hierarchical else ShapeId.Q3
+
+    if has_author:
+        return ShapeId.Q2
+
+    if has_ingredient:
+        return ShapeId.Q1
+
+    return None
