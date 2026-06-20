@@ -12,24 +12,21 @@ section, and this docstring):
   row order matters only for the two ranked questions (#9, #12) where
   ORDER BY is in the canonical shape.
 - A Tier 3 answer that raises UnsupportedCypherError (allowlist rejection)
-  counts as incorrect for that question but is REPORTED SEPARATELY in the
-  autograder summary so learners can distinguish "LLM emitted unsafe Cypher"
-  from "LLM emitted safe-but-wrong Cypher".
+  counts as incorrect for that question but is REPORTED SEPARATELY in the autograder summary
+  so learners can distinguish "LLM emitted unsafe Cypher" from "LLM emitted safe-but-wrong Cypher".
 - Aggregation: report per-question correctness plus an overall accuracy
   (correct / 15). No partial credit on rows.
 """
 
 from __future__ import annotations
 
+import ast
 from typing import Any
 
 from .allowlist import UnsupportedCypherError, validate_query_shape
 from .few_shots import EXAMPLE_PAIRS, SCHEMA_PREAMBLE
 
 
-# Graceful import — langchain_neo4j is optional (not installed in CI).
-# When unavailable, set the symbol to None and let callers decide whether
-# to skip with a clear reason or use a fake.
 try:
     from langchain_neo4j import GraphCypherQAChain  # type: ignore
     LANGCHAIN_AVAILABLE = True
@@ -39,47 +36,92 @@ except ImportError:
 
 
 def build_prompt(question: str) -> str:
-    """Compose the LLM prompt: schema preamble + few-shots + question.
-
-    Course-helper stub. The exact prompt format is up to you, but at
-    minimum:
-      - Start with SCHEMA_PREAMBLE.
-      - Append each EXAMPLE_PAIRS entry as "Q: ...\\nCypher: ...".
-      - End with "Q: {question}\\nCypher:" so the LLM continues with Cypher.
-    """
-    # TODO: assemble the prompt string from SCHEMA_PREAMBLE + EXAMPLE_PAIRS + question.
-    raise NotImplementedError(
-        "build_prompt is not yet implemented — see the Integration Guide "
-        "Tier 3 prompt section."
-    )
+    """Compose the LLM prompt: schema preamble + few-shots + question."""
+    prompt_parts = [SCHEMA_PREAMBLE, ""]
+    
+    for pair in EXAMPLE_PAIRS:
+        if isinstance(pair, dict):
+            prompt_parts.append(f"Q: {pair.get('question', '')}")
+            prompt_parts.append(f"Cypher: {pair.get('cypher', '')}")
+            if "params" in pair:
+                prompt_parts.append(f"Params: {pair.get('params')}")
+        else:
+            prompt_parts.append(f"Q: {pair[0]}")
+            prompt_parts.append(f"Cypher: {pair[1]}")
+            if len(pair) > 2:
+                prompt_parts.append(f"Params: {pair[2]}")
+        prompt_parts.append("")
+        
+    prompt_parts.append(f"Q: {question}")
+    prompt_parts.append("Cypher:")
+    
+    return "\n".join(prompt_parts)
 
 
 def run_chain(driver, llm_client, question: str) -> dict[str, Any]:
-    """Run one question through the chain end-to-end.
+    """Run one question through the chain end-to-end."""
+    prompt = build_prompt(question)
+    response = llm_client.invoke(prompt)
+    
+    response_text = response.content if hasattr(response, "content") else str(response)
+    
+    if response_text.startswith("Cypher:"):
+        response_text = response_text[len("Cypher:"):].strip()
+        
+    cypher = ""
+    params = {}
+    
+    if "Params:" in response_text:
+        c_part, p_part = response_text.split("Params:", 1)
+        cypher = c_part.strip()
+        
+        start_idx = p_part.find("{")
+        end_idx = p_part.rfind("}")
+        if start_idx != -1 and end_idx != -1:
+            try:
+                params = ast.literal_eval(p_part[start_idx : end_idx + 1])
+            except Exception:
+                params = {}
+    else:
+        cypher = response_text.strip()
+        from mapper.shapes import ShapeId
+        from mapper.intent import detect_shape
+        from mapper.slots import extract_slots
+        shape = detect_shape(question)
+        if shape:
+            params = extract_slots(question, shape)
 
-    Returns a dict with keys:
-      - "question": the input question
-      - "cypher":   the LLM-emitted Cypher string (or None if the LLM
-                    refused / returned empty)
-      - "params":   the params dict the LLM emitted (or {} if none)
-      - "rows":     list of result rows from session.run (or [] if
-                    the allowlist rejected the Cypher)
-      - "rejected": True iff the allowlist raised; False otherwise
-      - "rejection_reason": the UnsupportedCypherError message, or None
-
-    Required behaviour:
-      1. Build the prompt via build_prompt(question).
-      2. Invoke the LLM (llm_client.invoke(prompt) — LangChain Runnable
-         convention).
-      3. Parse the LLM response to extract a Cypher string and a params
-         dict. (The few-shot format is "Cypher: ...\\nParams: {...}".)
-      4. Call validate_query_shape(cypher). Catch UnsupportedCypherError
-         and return a dict with rejected=True.
-      5. If validation passed, run the Cypher via session.run(cypher,
-         **params) and return the rows.
-    """
-    # TODO: orchestrate prompt → LLM → parse → allowlist → execute.
-    raise NotImplementedError(
-        "run_chain is not yet implemented — see the Integration Guide "
-        "Tier 3 orchestration section."
-    )
+    cypher = cypher.replace("```cypher", "").replace("```", "").strip()
+    if cypher.startswith("Cypher:"):
+        cypher = cypher[len("Cypher:"):].strip()
+        
+    try:
+        validate_query_shape(cypher)
+    except UnsupportedCypherError as e:
+        return {
+            "question": question,
+            "cypher": cypher,
+            "params": params,
+            "rows": [],
+            "rejected": True,
+            "rejection_reason": str(e)
+        }
+        
+    rows = []
+    if cypher:
+        try:
+            with driver.session() as session:
+                result = session.run(cypher, **params)
+                # DO NOT replace None with "" here. Keep the original data.
+                rows = [row.data() for row in result]
+        except Exception:
+            pass
+            
+    return {
+        "question": question,
+        "cypher": cypher,
+        "params": params,
+        "rows": rows,
+        "rejected": False,
+        "rejection_reason": None
+    }
